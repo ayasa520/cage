@@ -1,0 +1,211 @@
+diff --git a/backend/wayland/backend.c b/backend/wayland/backend.c
+index 8cef72c..32b0d5a 100644
+--- a/backend/wayland/backend.c
++++ b/backend/wayland/backend.c
+@@ -52,6 +52,12 @@ struct wlr_wl_backend *get_wl_backend_from_backend(struct wlr_backend *wlr_backe
+ 	return backend;
+ }
+ 
++struct wlr_wl_output *get_wl_output_from_wlr_output(struct wlr_output *wlr_output) {
++	assert(wlr_output_is_wl(wlr_output));
++	struct wlr_wl_output *output = wl_container_of(wlr_output, output, wlr_output);
++	return output;
++}
++
+ static int dispatch_events(int fd, uint32_t mask, void *data) {
+ 	struct wlr_wl_backend *wl = data;
+ 
+ diff --git a/backend/wayland/pointer.c b/backend/wayland/pointer.c
+index 431aef9..55fdc69 100644
+--- a/backend/wayland/pointer.c
++++ b/backend/wayland/pointer.c
+@@ -56,7 +56,17 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+ 	output->enter_serial = serial;
+ 	output->cursor.pointer = pointer;
+ 	update_wl_output_cursor(output);
+-	output->cursor.pointer->confined_pointer = zwp_pointer_constraints_v1_confine_pointer(output->backend->pointer_constraints, output->surface, seat->wl_pointer, NULL, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
++
++	// Auto-confine pointer when entering the window
++	if (output->backend->pointer_constraints) {
++		pointer->confined_pointer = zwp_pointer_constraints_v1_confine_pointer(
++			output->backend->pointer_constraints,
++			output->surface,
++			seat->wl_pointer,
++			NULL,
++			ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT
++		);
++	}
+ }
+ 
+ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
+@@ -76,11 +86,21 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
+ 		seat->active_pointer = NULL;
+ 	}
+ 
+-	if (output->cursor.pointer == seat->active_pointer) {
++	struct wlr_wl_pointer *pointer = output_get_pointer(output, wl_pointer);
++	if (pointer && output->cursor.pointer == pointer) {
+ 		output->enter_serial = 0;
+ 		output->cursor.pointer = NULL;
++
++		// Clean up any active constraints
++		if (pointer->confined_pointer) {
++			zwp_confined_pointer_v1_destroy(pointer->confined_pointer);
++			pointer->confined_pointer = NULL;
++		}
++		if (pointer->locked_pointer) {
++			zwp_locked_pointer_v1_destroy(pointer->locked_pointer);
++			pointer->locked_pointer = NULL;
++		}
+ 	}
+-	zwp_confined_pointer_v1_destroy(output->cursor.pointer->confined_pointer);
+ }
+ 
+ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
+@@ -557,3 +577,104 @@ void finish_seat_pointer(struct wlr_wl_seat *seat) {
+ 	seat->wl_pointer = NULL;
+ 	seat->active_pointer = NULL;
+ }
++
++// Locked pointer event handlers
++static void locked_pointer_handle_locked(void *data,
++		struct zwp_locked_pointer_v1 *locked_pointer) {
++	// Pointer is now locked, we can start sending relative motion events
++	wlr_log(WLR_DEBUG, "Pointer locked by host compositor");
++}
++
++static void locked_pointer_handle_unlocked(void *data,
++		struct zwp_locked_pointer_v1 *locked_pointer) {
++	// Pointer is unlocked
++	wlr_log(WLR_DEBUG, "Pointer unlocked by host compositor");
++}
++
++static const struct zwp_locked_pointer_v1_listener locked_pointer_listener = {
++	.locked = locked_pointer_handle_locked,
++	.unlocked = locked_pointer_handle_unlocked,
++};
++
++// API function to request pointer lock from host compositor
++bool wlr_wl_output_lock_pointer(struct wlr_output *wlr_output) {
++	struct wlr_wl_output *output = get_wl_output_from_wlr_output(wlr_output);
++	if (!output || !output->cursor.pointer) {
++		return false;
++	}
++
++	struct wlr_wl_pointer *pointer = output->cursor.pointer;
++	struct wlr_wl_backend *backend = output->backend;
++
++	if (!backend->pointer_constraints) {
++		wlr_log(WLR_ERROR, "Host compositor doesn't support pointer constraints");
++		return false;
++	}
++
++	// If already locked, do nothing
++	if (pointer->locked_pointer) {
++		return true;
++	}
++
++	// Clean up confine constraint before locking
++	if (pointer->confined_pointer) {
++		zwp_confined_pointer_v1_destroy(pointer->confined_pointer);
++		pointer->confined_pointer = NULL;
++	}
++
++	// Request pointer lock from host
++	struct wlr_wl_seat *seat;
++	wl_list_for_each(seat, &backend->seats, link) {
++		if (seat->active_pointer == pointer) {
++			pointer->locked_pointer = zwp_pointer_constraints_v1_lock_pointer(
++				backend->pointer_constraints,
++				output->surface,
++				seat->wl_pointer,
++				NULL, // no region for lock
++				ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT
++			);
++
++			if (pointer->locked_pointer) {
++				zwp_locked_pointer_v1_add_listener(pointer->locked_pointer,
++					&locked_pointer_listener, pointer);
++				return true;
++			}
++			break;
++		}
++	}
++
++	return false;
++}
++
++// API function to unlock pointer
++void wlr_wl_output_unlock_pointer(struct wlr_output *wlr_output) {
++	struct wlr_wl_output *output = get_wl_output_from_wlr_output(wlr_output);
++	if (!output || !output->cursor.pointer) {
++		return;
++	}
++
++	struct wlr_wl_pointer *pointer = output->cursor.pointer;
++	struct wlr_wl_backend *backend = output->backend;
++
++	if (pointer->locked_pointer) {
++		zwp_locked_pointer_v1_destroy(pointer->locked_pointer);
++		pointer->locked_pointer = NULL;
++
++		// Restore confine constraint after unlocking
++		if (backend->pointer_constraints && !pointer->confined_pointer) {
++			struct wlr_wl_seat *seat;
++			wl_list_for_each(seat, &backend->seats, link) {
++				if (seat->active_pointer == pointer) {
++					pointer->confined_pointer = zwp_pointer_constraints_v1_confine_pointer(
++						backend->pointer_constraints,
++						output->surface,
++						seat->wl_pointer,
++						NULL,
++						ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT
++					);
++					break;
++				}
++			}
++		}
++	}
++}
+
+diff --git a/include/backend/wayland.h b/include/backend/wayland.h
+index 6ee084a..b41c387 100644
+--- a/include/backend/wayland.h
++++ b/include/backend/wayland.h
+@@ -131,6 +131,7 @@ struct wlr_wl_pointer {
+ 
+ 	struct wl_list link;
+ 	struct zwp_confined_pointer_v1* confined_pointer;
++	struct zwp_locked_pointer_v1* locked_pointer;
+ };
+ 
+ struct wlr_wl_touch_points {
+@@ -175,6 +176,7 @@ struct wlr_wl_seat {
+ struct wlr_wl_backend *get_wl_backend_from_backend(struct wlr_backend *backend);
+ struct wlr_wl_output *get_wl_output_from_surface(struct wlr_wl_backend *wl,
+ 	struct wl_surface *surface);
++struct wlr_wl_output *get_wl_output_from_wlr_output(struct wlr_output *wlr_output);
+ void update_wl_output_cursor(struct wlr_wl_output *output);
+ 
+ void init_seat_keyboard(struct wlr_wl_seat *seat);
+
+diff --git a/include/wlr/backend/wayland.h b/include/wlr/backend/wayland.h
+index c732de6..5287b2e 100644
+--- a/include/wlr/backend/wayland.h
++++ b/include/wlr/backend/wayland.h
+@@ -73,4 +73,15 @@ void wlr_wl_output_set_app_id(struct wlr_output *output, const char *app_id);
+  */
+ struct wl_surface *wlr_wl_output_get_surface(struct wlr_output *output);
+ 
++/**
++ * Request pointer lock from the host compositor for this Wayland output.
++ * Returns true if the request was sent successfully.
++ */
++bool wlr_wl_output_lock_pointer(struct wlr_output *output);
++
++/**
++ * Unlock the pointer for this Wayland output.
++ */
++void wlr_wl_output_unlock_pointer(struct wlr_output *output);
++
+ #endif

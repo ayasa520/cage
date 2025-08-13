@@ -9,6 +9,54 @@ project('cage', 'c',
   ],
 )
 
+# Apply patches from patches directory
+patch_dir = meson.current_source_dir() / 'patches'
+
+# Check if patches are already applied using a more reliable method
+patch_marker_file = meson.current_build_dir() / '.patches_applied'
+patches_applied = run_command('test', '-f', patch_marker_file, check: false).returncode() == 0
+
+if not patches_applied
+  # Patch wlroots subproject
+  wlroots_patch_dir = patch_dir
+  wlroots_patches = [
+    '0001-confine-pointer.patch',
+    '0002-wlroots-lock-pointer.patch',
+  ]
+
+  foreach patch_file : wlroots_patches
+    patch_path = wlroots_patch_dir / patch_file
+    # Check if patch can be applied (dry run)
+    check_result = run_command('git', 'apply', '--check', patch_path, 
+                              '--directory=subprojects/wlroots', 
+                              check: false)
+    if check_result.returncode() == 0
+      message('Applying patch: @0@'.format(patch_file))
+      run_command('git', 'apply', patch_path, 
+                  '--directory=subprojects/wlroots', 
+                  check: true)
+    else
+      message('Patch @0@ already applied or conflicts, skipping'.format(patch_file))
+    endif
+  endforeach
+
+  # Patch main project
+  cage_patch = '0003-cage-lock-pointer.patch'
+  cage_patch_path = patch_dir / cage_patch
+  check_result = run_command('git', 'apply', '--check', cage_patch_path, check: false)
+  if check_result.returncode() == 0
+    message('Applying patch: @0@'.format(cage_patch))
+    run_command('git', 'apply', cage_patch_path, check: true)
+  else
+    message('Patch @0@ already applied or conflicts, skipping'.format(cage_patch))
+  endif
+  
+  # Create marker file to indicate patches have been processed
+  run_command('touch', patch_marker_file, check: true)
+else
+  message('Patches already processed, skipping')
+endif
+
 add_project_arguments(
   [
     '-DWLR_USE_UNSTABLE',
