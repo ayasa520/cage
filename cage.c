@@ -538,6 +538,10 @@ main(int argc, char *argv[])
 	server.pointer_constraint.notify = handle_pointer_constraint;
 	wl_signal_add(&server.pointer_constraints->events.new_constraint, &server.pointer_constraint);
 
+	// Initialize host pointer constraints for passthrough (if running nested)
+	// TODO: Implement proper host constraint passthrough
+	server.host_pointer_constraints = NULL;
+
 #if CAGE_HAS_XWAYLAND
 	struct wlr_xcursor_manager *xcursor_manager = NULL;
 	struct wlr_xwayland *xwayland = wlr_xwayland_create(server.wl_display, compositor, true);
