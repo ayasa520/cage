@@ -1,0 +1,113 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ waydroid-helper ]
+  pull_request:
+    branches: [ waydroid-helper ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install \
+          build-essential \
+          g++ \
+          libstdc++-13-dev \
+          meson \
+          ninja-build \
+          libxkbcommon-dev \
+          libegl-dev \
+          libgbm-dev \
+          libgles2-mesa-dev \
+          libudev-dev \
+          libseat-dev \
+          libinput-dev \
+          libdrm-dev \
+          libexpat1-dev \
+          libcap-dev \
+          libsystemd-dev \
+          libmtdev-dev \
+          libevdev-dev \
+          libwacom-dev \
+          libgudev-1.0-dev \
+          libglib2.0-dev \
+          libffi-dev \
+          libpcre2-dev \
+          mesa-common-dev \
+          libxcb1-dev \
+          libxcb-render0-dev \
+          libxcb-render-util0-dev \
+          libxcb-util-dev \
+          libxcb-dri3-dev \
+          libxcb-present-dev \
+          libxcb-shm0-dev \
+          libxcb-xfixes0-dev \
+          libxcb-xinput-dev \
+          libx11-dev \
+          libx11-xcb-dev \
+          liblzma-dev
+
+    - name: Build with meson
+      run: |
+        CC=gcc CXX=g++ LDFLAGS='-lstdc++' meson setup build \
+          --default-library=static \
+          --prefer-static \
+          --buildtype=release \
+          -Dwerror=false \
+          -Dwlroots:backends=drm,libinput,x11
+        meson compile -C build
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cage-waydroid-helper-${{ matrix.arch }}
+        path: build/cage
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/waydroid-helper'
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Get current timestamp
+      id: timestamp
+      run: echo "timestamp=$(date +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
+
+    - name: Prepare release files
+      run: |
+        mkdir -p release
+        mv cage-waydroid-helper-amd64/cage release/cage-waydroid-helper_${{ steps.timestamp.outputs.timestamp }}_amd64
+        mv cage-waydroid-helper-arm64/cage release/cage-waydroid-helper_${{ steps.timestamp.outputs.timestamp }}_arm64
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: release-${{ steps.timestamp.outputs.timestamp }}
+        name: "${{ steps.timestamp.outputs.timestamp }}"
+        files: release/*
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
